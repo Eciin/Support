@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# Configuration values - these will be populated from Terraform
 VSPHERE_USER="${VSPHERE_USER:-i416434@fhict.local}"
 VSPHERE_PASSWORD="${VSPHERE_PASSWORD:-Icw5F[MRci}"
 VSPHERE_SERVER="${VSPHERE_SERVER:-vcenter.netlab.fontysict.nl}"
@@ -23,21 +22,17 @@ LOAD_BALANCER_PORT="${LOAD_BALANCER_PORT:-8080}"
 LOG_FILE="${LOG_FILE:-auto-scaling.log}" 
 VM_FOLDER="${VM_FOLDER:-/Netlab-DC/vm/_Courses/I3-DB01/i416434/autoscaling}"
 
-# Create log file or clear existing one
 echo "Auto-Scaling Script Started at $(date)" > $LOG_FILE
 
-# Function to log messages
 log_message() {
     echo "$(date): $1" | tee -a $LOG_FILE
 }
 
 log_message "Initializing auto-scaling environment for vSphere"
 
-# Check for required packages
 check_dependencies() {
     log_message "Checking for required dependencies..."
     
-    # Check for govc (vSphere CLI tool)
     if ! command -v govc &> /dev/null; then
         log_message "Installing govc (vSphere CLI tool)..."
         curl -L -o /tmp/govc.tar.gz https://github.com/vmware/govmomi/releases/latest/download/govc_Linux_x86_64.tar.gz
@@ -48,14 +43,12 @@ check_dependencies() {
         rm -rf /tmp/govc /tmp/govc.tar.gz
     fi
     
-    # Check for nginx
     if ! command -v nginx &> /dev/null; then
         log_message "Installing nginx..."
         sudo apt-get update
         sudo apt-get install -y nginx
     fi
     
-    # Install stress for load testing
     if ! command -v stress &> /dev/null; then
         log_message "Installing stress tool for load testing..."
         sudo apt-get update
@@ -65,11 +58,9 @@ check_dependencies() {
     log_message "All dependencies installed."
 }
 
-# Configure govc environment
 setup_govc() {
     log_message "Setting up govc environment..."
     
-    # Set environment variables for govc
     export GOVC_URL="https://$VSPHERE_SERVER"
     export GOVC_USERNAME="$VSPHERE_USER"
     export GOVC_PASSWORD="$VSPHERE_PASSWORD"
@@ -79,7 +70,6 @@ setup_govc() {
     export GOVC_DATASTORE="$VSPHERE_DATASTORE"
     export GOVC_NETWORK="$VSPHERE_NETWORK"
     
-    # Verify connection
     if govc about &> /dev/null; then
         log_message "Successfully connected to vSphere server"
     else
@@ -88,12 +78,10 @@ setup_govc() {
     fi
 }
 
-# Function to get a list of current VM names
 get_vm_list() {
     govc ls /$VM_FOLDER/ | grep $VM_BASE_NAME | grep -v "${VM_BASE_NAME}-lb" || echo ""
 }
 
-# Function to create a new VM by cloning the template
 create_vm() {
     local vm_num=$1
     local vm_name="${VM_BASE_NAME}-${vm_num}"
@@ -101,8 +89,6 @@ create_vm() {
     
     log_message "Creating new VM: $vm_name by cloning template $VSPHERE_TEMPLATE"
     
-    # Create the VM by cloning the template
-    # Modify this line in your create_vm function
 govc vm.clone -vm "/$VSPHERE_TEMPLATE" -on=true -template=false -ds="$VSPHERE_DATASTORE" -pool="$VSPHERE_RESOURCE_POOL" -folder="$VM_FOLDER" "$vm_name"
     
     if [ $? -ne 0 ]; then
@@ -110,7 +96,6 @@ govc vm.clone -vm "/$VSPHERE_TEMPLATE" -on=true -template=false -ds="$VSPHERE_DA
         return 1
     fi
     
-    # Wait for the VM to boot and get an IP
     local max_attempts=100
     local attempts=0
     local vm_ip=""
@@ -133,16 +118,13 @@ govc vm.clone -vm "/$VSPHERE_TEMPLATE" -on=true -template=false -ds="$VSPHERE_DA
     echo "$vm_ip"
 }
 
-# Function to power off and delete a VM
 delete_vm() {
     local vm_path=$1
     
     log_message "Deleting VM: $vm_path"
     
-    # Power off the VM
     govc vm.power -off "$vm_path"
     
-    # Delete the VM
     govc vm.destroy "$vm_path"
     
     if [ $? -eq 0 ]; then
@@ -152,16 +134,13 @@ delete_vm() {
     fi
 }
 
-# Function to get current CPU load percentage
 get_cpu_load() {
     top -bn1 | grep "Cpu(s)" | awk '{print int($2 + $4)}'
 }
 
-# Setup initial load balancer configuration
 setup_load_balancer() {
     log_message "Setting up load balancer configuration"
     
-    # Create nginx load balancer config
     sudo mkdir -p /etc/nginx/conf.d/
     sudo tee /etc/nginx/conf.d/load-balancer.conf > /dev/null << EOF
 upstream app_servers {
@@ -187,10 +166,8 @@ server {
 }
 EOF
 
-    # Create servers file to track our servers
     echo "server_name,ip_address,status" > servers.txt
     
-    # Reload nginx
     sudo systemctl restart nginx >> $LOG_FILE 2>&1 || {
         log_message "Failed to reload nginx. Check if it's installed and running."
         exit 1
@@ -199,22 +176,18 @@ EOF
     log_message "Load balancer configured on port $LOAD_BALANCER_PORT"
 }
 
-# Function to add a server to the load balancer
 add_server_to_lb() {
     local vm_ip=$1
     
     log_message "Adding server $vm_ip to load balancer"
     
-    # Check if server already exists in config
     if grep -q "$vm_ip:$APP_PORT" /etc/nginx/conf.d/load-balancer.conf; then
         log_message "Server $vm_ip already in load balancer configuration"
         return 0
     fi
     
-    # Add the server to the nginx config
     sudo sed -i "/upstream app_servers {/a\\    server ${vm_ip}:${APP_PORT};" /etc/nginx/conf.d/load-balancer.conf
     
-    # Reload nginx
     sudo nginx -s reload >> $LOG_FILE 2>&1 || {
         log_message "Failed to reload nginx after adding server $vm_ip"
         return 1
@@ -224,16 +197,13 @@ add_server_to_lb() {
     return 0
 }
 
-# Function to remove a server from the load balancer
 remove_server_from_lb() {
     local vm_ip=$1
     
     log_message "Removing server $vm_ip from load balancer"
     
-    # Remove the server from nginx config
     sudo sed -i "\|server ${vm_ip}:${APP_PORT};|d" /etc/nginx/conf.d/load-balancer.conf
     
-    # Reload nginx
     sudo nginx -s reload >> $LOG_FILE 2>&1 || {
         log_message "Failed to reload nginx after removing server $vm_ip"
         return 1
@@ -243,7 +213,6 @@ remove_server_from_lb() {
     return 0
 }
 
-# Function to verify VM is serving web content
 check_vm_web_service() {
     local vm_ip=$1
     local timeout=5
@@ -272,25 +241,19 @@ scale_up() {
     
     log_message "Scaling up to $next_vm_num servers"
     
-    # Create new VM
     local vm_ip=$(create_vm $next_vm_num)
     
     if [ -n "$vm_ip" ]; then
-        # Add to servers tracking file
         echo "${VM_BASE_NAME}-${next_vm_num},$vm_ip,active" >> servers.txt
         
-        # Wait a bit for the web service to start
         log_message "Waiting for web service to start on $vm_ip..."
         sleep 30
         
-        # Check if web service is running
         if check_vm_web_service $vm_ip; then
-            # Add to load balancer
             add_server_to_lb $vm_ip
             log_message "Scale up complete: ${VM_BASE_NAME}-${next_vm_num} ($vm_ip) added to pool"
         else
             log_message "Web service not responding on new VM. Will try again later."
-            # Mark as pending in server list
             sed -i "s/${VM_BASE_NAME}-${next_vm_num},$vm_ip,active/${VM_BASE_NAME}-${next_vm_num},$vm_ip,pending/" servers.txt
         fi
     else
@@ -298,7 +261,6 @@ scale_up() {
     fi
 }
 
-# Function to scale down - remove a VM
 scale_down() {
     local vm_list=$(get_vm_list)
     local current_vms=$(echo "$vm_list" | grep -v "^$" | wc -l)
@@ -310,50 +272,40 @@ scale_down() {
     
     log_message "Scaling down from $current_vms servers"
     
-    # Get the last VM name and path
     local last_vm=$(echo "$vm_list" | tail -1)
     
-    # Get the IP of the last VM
     local last_vm_ip=$(govc vm.ip "$last_vm" 2>/dev/null)
     
     if [ -z "$last_vm_ip" ]; then
         log_message "Could not get IP for VM $last_vm. Trying to delete anyway."
     else
-        # Remove from load balancer
         remove_server_from_lb $last_vm_ip
     fi
     
-    # Delete the VM
     delete_vm "$last_vm"
     
-    # Update servers.txt - remove the entry with this VM name
     local vm_name=$(basename "$last_vm")
     sed -i "\|$vm_name|d" servers.txt
     
     log_message "Scale down complete: $vm_name removed from pool"
 }
 
-# Function to simulate load (for demonstration purposes)
 simulate_load() {
     log_message "Starting load simulation for demonstration"
     
-    # Simulate increasing load
     for i in {1..3}; do
         echo "75" > /tmp/simulated_load
         log_message "Simulated load increased to 75% (should trigger scale up)"
         sleep 90
         
-        # Simulate decreasing load
         echo "25" > /tmp/simulated_load
         log_message "Simulated load decreased to 25% (should trigger scale down)"
         sleep 90
     done
     
-    # Reset load simulation
     rm -f /tmp/simulated_load
 }
 
-# Function to get load (real or simulated)
 get_system_load() {
     if [ -f /tmp/simulated_load ]; then
         cat /tmp/simulated_load
@@ -362,25 +314,20 @@ get_system_load() {
     fi
 }
 
-# Function to check and repair the server pool
 check_servers() {
     log_message "Checking server pool health..."
     
-    # Get current servers from nginx config
     local lb_servers=$(grep "server" /etc/nginx/conf.d/load-balancer.conf | grep -v "127.0.0.1" | awk '{print $2}' | cut -d: -f1)
-    
-    # Check each server
+
     for server_ip in $lb_servers; do
         if ! check_vm_web_service $server_ip; then
             log_message "Server $server_ip not responding. Removing from load balancer."
             remove_server_from_lb $server_ip
             
-            # Update status in servers.txt
             sed -i "s/,[^,]*,$server_ip,active/,$server_ip,failed/" servers.txt
         fi
     done
     
-    # Check for pending servers that might be ready now
     while IFS=, read -r vm_name vm_ip status; do
         if [ "$status" = "pending" ]; then
             if check_vm_web_service $vm_ip; then
@@ -392,7 +339,6 @@ check_servers() {
     done < <(tail -n +2 servers.txt)
 }
 
-# Main monitoring function
 monitor_load() {
     log_message "Starting load monitoring..."
     
@@ -401,25 +347,21 @@ monitor_load() {
     while true; do
         CURRENT_LOAD=$(get_system_load)
         
-        # Get current active VM count from vSphere
         local vm_list=$(get_vm_list)
         local CURRENT_SERVERS=$(echo "$vm_list" | grep -v "^$" | wc -l)
         
         log_message "Current load: $CURRENT_LOAD%, Running servers: $CURRENT_SERVERS"
         
-        # Check server health every 5 cycles
         check_health_counter=$((check_health_counter + 1))
         if [ $check_health_counter -ge 5 ]; then
             check_servers
             check_health_counter=0
         fi
         
-        # Scale up logic
         if [ $CURRENT_LOAD -gt $MAX_LOAD ] && [ $CURRENT_SERVERS -lt $MAX_SERVERS ]; then
             scale_up
         fi
         
-        # Scale down logic
         if [ $CURRENT_LOAD -lt $MIN_LOAD ] && [ $CURRENT_SERVERS -gt $MIN_SERVERS ]; then
             scale_down
         fi
@@ -428,40 +370,41 @@ monitor_load() {
     done
 }
 
-# Start the setup process
+test_load_balancing() {
+    log_message "Testing load balancing..."
+    
+    for i in {1..10}; do
+        echo "Request $i:"
+        curl -s -I "http://localhost:${LOAD_BALANCER_PORT}/" | grep "Server"
+        sleep 1
+    done
+}
+
 check_dependencies
 setup_govc
 
-# Verify VM folder exists
 if ! govc ls "$VM_FOLDER" &>/dev/null; then
     log_message "VM folder /$VM_FOLDER not found. Please check your folder name."
     exit 1
 fi
 
-# Verify template exists
 if ! govc ls "$VSPHERE_TEMPLATE" &>/dev/null; then
     log_message "Template $VSPHERE_TEMPLATE not found. Please check the template path."
     exit 1
 fi
 
-# Setup load balancer
 setup_load_balancer
 
-# Get current VMs
 EXISTING_VMS=$(get_vm_list | grep $VM_BASE_NAME)
 
-# If no existing VMs, wait for Terraform to create the initial servers
 if [ -z "$EXISTING_VMS" ]; then
     log_message "No existing servers found. Waiting for Terraform to create initial servers..."
     
-    # Give Terraform some time to create VMs
     sleep 60
     
-    # Try again after waiting
     EXISTING_VMS=$(get_vm_list | grep $VM_BASE_NAME)
 fi
 
-# Add existing VMs to load balancer
 if [ -n "$EXISTING_VMS" ]; then
     log_message "Found existing servers. Adding to load balancer."
     
@@ -482,12 +425,15 @@ if [ -n "$EXISTING_VMS" ]; then
     done
 fi
 
-# Start monitoring in background
+if [ "$1" = "test-lb" ]; then
+    log_message "Running load balancer test..."
+    test_load_balancing
+    exit 0
+fi
 log_message "Starting load monitoring in background..."
 monitor_load &
 MONITOR_PID=$!
 
-# Save PID for later termination
 echo $MONITOR_PID > auto-scaling.pid
 
 log_message "Setup complete. Auto-scaling system is now running."

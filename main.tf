@@ -73,6 +73,10 @@ resource "vsphere_virtual_machine" "load_balancer" {
       "echo 'student' | sudo -S bash -c \"export VM_FOLDER='${local.vm_folder}'\"",
       "echo 'student' | sudo -S bash -c \"export VM_BASE_NAME='${local.vm_base_name}'\"",
       "echo 'student' | sudo -S bash -c \"nohup bash /tmp/auto-scaling.sh > /tmp/auto-scaling-init.log 2>&1 &\"",
+      "echo 'student' | sudo -S ufw allow 22/tcp comment 'Allow SSH'",
+      "echo 'student' | sudo -S ufw allow 80/tcp comment 'Allow HTTP'",
+      "echo 'student' | sudo -S ufw allow 443/tcp comment 'Allow HTTPS'",
+      "echo 'student' | sudo -S ufw allow 8080/tcp comment 'Allow alternate HTTP port'",
       "sleep 5"
     ]
     
