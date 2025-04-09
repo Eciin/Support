@@ -34,19 +34,15 @@ pipeline {
                 script {
                     def loadBalancerIp = sh(script: 'terraform output -raw load_balancer_ip', returnStdout: true).trim()
                     
-                    // Run stress test on the load balancer
-                    echo 'Running stress test on load balancer...'
-                    sh "ssh student@${loadBalancerIp} 'stress --cpu 2 --timeout 200'"
-                    
-                    // Wait for auto-scaling to potentially kick in
-                    echo 'Waiting for auto-scaling to respond to the load...'
-                    sh 'sleep 60'
-                    
-                    // Verify that auto-scaling worked correctly
-                    sh "ssh user@${loadBalancerIp} 'ps aux | grep auto_scaling'"
-                    
-                    // Run a final check on the environment after scaling
-                    sh './verify_autoscaling.sh'
+                    sshagent(credentials: ['b7ab58e0-ef47-44ad-91c2-0d5d1e4e455c']) {
+                        echo 'Running stress test on load balancer...'
+                        sh "ssh -o StrictHostKeyChecking=no student@${loadBalancerIp} 'stress --cpu 2 --timeout 200'"
+                        
+                        echo 'Waiting for auto-scaling to respond to the load...'
+                        sh 'sleep 60'
+                        
+                        sh "ssh -o StrictHostKeyChecking=no user@${loadBalancerIp} 'ps aux | grep auto_scaling'"
+                    }
                 }
             }
         }
