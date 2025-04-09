@@ -40,8 +40,6 @@ pipeline {
                         
                         echo 'Waiting for auto-scaling to respond to the load...'
                         sh 'sleep 60'
-                        
-                        sh "ssh -o StrictHostKeyChecking=no user@${loadBalancerIp} 'ps aux | grep auto_scaling'"
                     }
                 }
             }
