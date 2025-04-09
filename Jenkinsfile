@@ -12,6 +12,7 @@ pipeline {
             steps {
                 echo 'Building application...'
                 sh 'terraform init'
+                sh 'chmod -R +x .terraform/providers'
                 sh 'terraform validate'
             }
         }
