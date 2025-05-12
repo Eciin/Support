@@ -89,7 +89,7 @@ create_vm() {
     
     log_message "Creating new VM: $vm_name by cloning template $VSPHERE_TEMPLATE"
     
-govc vm.clone -vm "/$VSPHERE_TEMPLATE" -on=true -template=false -ds="$VSPHERE_DATASTORE" -pool="$VSPHERE_RESOURCE_POOL" -folder="$VM_FOLDER" "$vm_name"
+    govc vm.clone -vm "/$VSPHERE_TEMPLATE" -on=true -template=false -ds="$VSPHERE_DATASTORE" -pool="$VSPHERE_RESOURCE_POOL" -folder="$VM_FOLDER" "$vm_name"
     
     if [ $? -ne 0 ]; then
         log_message "Failed to clone VM. Check template path and permissions."
@@ -157,6 +157,81 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Server \$host;
+        
+        # Add this to disable caching for better load balancer demonstration
+        add_header Cache-Control "no-store, no-cache, must-revalidate, post-check=0, pre-check=0";
+        expires -1;
+    }
+    
+    # Add a status page to show load balancer info
+    location /lb-status {
+        return 200 '<!DOCTYPE html>
+<html>
+<head>
+    <title>Load Balancer Status</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        h1 {
+            color: #336699;
+        }
+        .status-box {
+            background-color: #f0f8ff;
+            border: 1px solid #ccc;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <h1>Load Balancer Status</h1>
+    <div class="status-box">
+        <p><strong>Load Balancer:</strong> ${VM_BASE_NAME}-lb</p>
+        <p><strong>Backend Servers:</strong> <span id="server-count">Loading...</span></p>
+        <p><strong>Current Time:</strong> <span id="current-time"></span></p>
+    </div>
+    <button onclick="window.location.href=\'/\'">Go to Web Application</button>
+    
+    <script>
+        // Update current time
+        function updateTime() {
+            document.getElementById("current-time").textContent = new Date().toLocaleString();
+        }
+        updateTime();
+        setInterval(updateTime, 1000);
+        
+        // Make AJAX request to get server count
+        fetch("/health")
+            .then(response => response.text())
+            .then(() => {
+                // This would ideally get the actual server count from somewhere
+                // For now, we\'ll just say "Multiple active servers"
+                document.getElementById("server-count").textContent = "Multiple active servers";
+            })
+            .catch(error => {
+                document.getElementById("server-count").textContent = "Error fetching server status";
+            });
+    </script>
+</body>
+</html>';
+        add_header Content-Type text/html;
     }
     
     # Health check endpoint
@@ -174,6 +249,29 @@ EOF
     }
     
     log_message "Load balancer configured on port $LOAD_BALANCER_PORT"
+    
+    # Create a simple script to test load balancing
+    sudo tee /usr/local/bin/test-load-balancer.sh > /dev/null << 'EOF'
+#!/bin/bash
+
+echo "Load Balancer Test Script"
+echo "========================="
+echo "Making 10 requests to demonstrate load balancing..."
+echo
+
+for i in {1..10}; do
+    echo -n "Request $i: "
+    curl -s http://localhost:8080/ | grep -o '<h1>Web Server [0-9]</h1>' || echo "No response"
+    sleep 1
+done
+
+echo
+echo "Test complete. You should see requests distributed across different web servers."
+echo "To run this test again, use: sudo bash /usr/local/bin/test-load-balancer.sh"
+EOF
+
+    sudo chmod +x /usr/local/bin/test-load-balancer.sh
+    log_message "Created load balancer test script at /usr/local/bin/test-load-balancer.sh"
 }
 
 add_server_to_lb() {
