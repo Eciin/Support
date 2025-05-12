@@ -55,6 +55,12 @@ check_dependencies() {
         sudo apt-get install -y stress
     fi
     
+    if ! command -v sshpass &> /dev/null; then
+        log_message "Installing sshpass for non-interactive SSH..."
+        sudo apt-get update
+        sudo apt-get install -y sshpass
+    fi
+    
     log_message "All dependencies installed."
 }
 
@@ -115,7 +121,135 @@ create_vm() {
     fi
     
     log_message "VM $vm_name created with IP: $vm_ip"
-    echo "$vm_ip"
+    
+    # Wait for SSH to become available
+    log_message "Waiting for SSH to be available on $vm_ip..."
+    for i in {1..30}; do
+        if sshpass -p "student" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 student@$vm_ip "echo SSH is up" &> /dev/null; then
+            log_message "SSH is available after $i attempts"
+            break
+        fi
+        
+        log_message "Attempt $i: Waiting for SSH..."
+        sleep 10
+        
+        if [ $i -eq 30 ]; then
+            log_message "Failed to connect via SSH after 30 attempts"
+            return 1
+        fi
+    done
+    
+    # Configure the new webserver
+    log_message "Configuring webserver $vm_name..."
+    
+    # Create a temporary configuration script
+    cat > /tmp/configure-webserver-$vm_num.sh << EOF
+#!/bin/bash
+# Update and install packages
+echo 'student' | sudo -S apt-get update
+echo 'student' | sudo -S apt-get install -y nginx ufw
+
+# Create the custom HTML file
+cat << INNEREOF | sudo tee /var/www/html/index.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Web Server $vm_num</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            margin-top: 50px;
+            background-color: $([ $vm_num -eq 1 ] && echo "#f0f8ff" || [ $vm_num -eq 2 ] && echo "#ffe4e1" || [ $vm_num -eq 3 ] && echo "#f0fff0" || [ $vm_num -eq 4 ] && echo "#fff8dc" || echo "#e6e6fa");
+        }
+        .container {
+            background-color: white;
+            border-radius: 10px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            padding: 20px;
+            display: inline-block;
+            min-width: 400px;
+        }
+        h1 {
+            color: $([ $vm_num -eq 1 ] && echo "#4682b4" || [ $vm_num -eq 2 ] && echo "#cd5c5c" || [ $vm_num -eq 3 ] && echo "#2e8b57" || [ $vm_num -eq 4 ] && echo "#daa520" || echo "#9370db");
+        }
+        .server-info {
+            margin: 20px;
+            font-size: 18px;
+        }
+        .timestamp {
+            font-size: 14px;
+            color: gray;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <h1>Web Server $vm_num</h1>
+        <div class='server-info'>
+            <p><strong>Server Name:</strong> ${VM_BASE_NAME}-$vm_num</p>
+            <p><strong>Server IP:</strong> <span id='server-ip'></span></p>
+            <p><strong>Unique ID:</strong> $vm_num</p>
+        </div>
+        <div class='timestamp'>
+            <p>Page loaded at: <span id='timestamp'></span></p>
+        </div>
+    </div>
+    <script>
+        document.getElementById('server-ip').textContent = location.hostname;
+        document.getElementById('timestamp').textContent = new Date().toLocaleString();
+        // Refresh the page every 5 seconds to demonstrate load balancing
+        setTimeout(function() {
+            window.location.reload();
+        }, 5000);
+    </script>
+</body>
+</html>
+INNEREOF
+
+# Configure UFW firewall - IMPORTANT TO ALLOW TRAFFIC
+echo 'student' | sudo -S ufw allow 22/tcp comment 'Allow SSH'
+echo 'student' | sudo -S ufw allow 80/tcp comment 'Allow HTTP'
+echo 'student' | sudo -S ufw allow 443/tcp comment 'Allow HTTPS'
+echo 'student' | sudo -S ufw allow 8080/tcp comment 'Allow alternate HTTP port'
+
+# Enable UFW non-interactively
+echo 'student' | sudo -S bash -c 'echo "y" | ufw enable'
+echo 'student' | sudo -S ufw status
+
+# Start and enable nginx
+echo 'student' | sudo -S systemctl enable nginx
+echo 'student' | sudo -S systemctl restart nginx
+
+# Report success
+echo "Webserver $vm_num configuration completed successfully"
+EOF
+    
+    # Copy and execute the configuration script on the new VM
+    sshpass -p "student" scp -o StrictHostKeyChecking=no /tmp/configure-webserver-$vm_num.sh student@$vm_ip:/tmp/
+    sshpass -p "student" ssh -o StrictHostKeyChecking=no student@$vm_ip "chmod +x /tmp/configure-webserver-$vm_num.sh && /tmp/configure-webserver-$vm_num.sh"
+    
+    if [ $? -ne 0 ]; then
+        log_message "Failed to configure webserver $vm_name. VM may not be set up correctly."
+    else
+        log_message "Successfully configured webserver $vm_name"
+    fi
+    
+    # Clean up
+    rm -f /tmp/configure-webserver-$vm_num.sh
+    
+    # Verify webserver is responding before adding to load balancer
+    log_message "Verifying webserver is accessible before adding to load balancer..."
+    if check_vm_web_service $vm_ip; then
+        log_message "Webserver $vm_name is responding correctly"
+        echo "$vm_ip"
+        return 0
+    else
+        log_message "Webserver $vm_name is not responding. Will retry later."
+        echo "$vm_ip"
+        return 0  # Still return the IP so we can try again later
+    fi
 }
 
 delete_vm() {
@@ -434,7 +568,7 @@ check_servers() {
                 sed -i "s/$vm_name,$vm_ip,pending/$vm_name,$vm_ip,active/" servers.txt
             fi
         fi
-    done < <(tail -n +2 servers.txt)
+    done < <(tail -n +2 servers.txt 2>/dev/null || echo "")
 }
 
 monitor_load() {
