@@ -37,7 +37,7 @@ pipeline {
                     sh "sshpass -p 'student' ssh -o StrictHostKeyChecking=no student@${loadBalancerIp} 'stress --cpu 2 --timeout 200'"
                     
                     echo 'Waiting for auto-scaling to respond to the load...'
-                    sh 'sleep 60'
+                    sh 'sleep 90'
                 }
             }
         }
@@ -50,7 +50,8 @@ pipeline {
         }
         
         stage('Approval for Production') {
-            steps {
+            steps
+            timeout(time: 30, unit: 'SECONDS') {
                 input message: 'Tests on staging passed. Deploy to production?', ok: 'Approve'
             }
         }
