@@ -27,7 +27,7 @@ resource "vsphere_virtual_machine" "load_balancer" {
   scsi_type        = data.vsphere_virtual_machine.Server.scsi_type
   
   network_interface {
-    network_id   = data.vsphere_network.dynamic_network_internet.id
+    network_id   = data.vsphere_network.static_network_internet.id
     adapter_type = data.vsphere_virtual_machine.Server.network_interface_types[0]
   }
   
@@ -47,7 +47,12 @@ resource "vsphere_virtual_machine" "load_balancer" {
         domain    = "local"
       }
       
-      network_interface {}
+      network_interface {
+        ipv4_address = "192.168.154.135"
+        ipv4_netmask = 24        
+      }
+      ipv4_gateway    = "192.168.154.1"
+      dns_server_list = ["192.168.200.10"]      
     }
   }
   
@@ -103,7 +108,7 @@ resource "vsphere_virtual_machine" "webserver" {
   scsi_type        = data.vsphere_virtual_machine.Webserver.scsi_type
   
   network_interface {
-    network_id   = data.vsphere_network.dynamic_network_internet.id
+    network_id   = data.vsphere_network.static_network_internet.id
     adapter_type = data.vsphere_virtual_machine.Webserver.network_interface_types[0]
   }
   
@@ -123,7 +128,12 @@ resource "vsphere_virtual_machine" "webserver" {
         domain    = "local"
       }
       
-      network_interface {}
+      network_interface {
+        ipv4_address = "192.168.154.137"
+        ipv4_netmask = 24          
+      }
+      ipv4_gateway    = "192.168.154.1"
+      dns_server_list = ["192.168.200.10"]      
     }
   }
   
@@ -134,7 +144,7 @@ resource "vsphere_virtual_machine" "webserver" {
       "echo 'student' | sudo -S apt-get install -y nginx ufw",
       "echo 'student' | sudo -S mkdir -p /var/www/html",
       
-      # Create a more distinctive website for each server
+      # Create a more distinctive website for each server 
       "cat << EOF | sudo tee /var/www/html/index.html",
       "<!DOCTYPE html>",
       "<html>",

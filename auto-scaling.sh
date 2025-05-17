@@ -1,9 +1,11 @@
 #!/bin/bash
 
+# vSphere connection configuration
 VSPHERE_USER="${VSPHERE_USER:-i416434@fhict.local}"
 VSPHERE_PASSWORD="${VSPHERE_PASSWORD:-Icw5F[MRci}"
 VSPHERE_SERVER="${VSPHERE_SERVER:-vcenter.netlab.fontysict.nl}"
 
+# vSphere environment settings
 VSPHERE_DATACENTER="${VSPHERE_DATACENTER:-Netlab-DC}"
 VSPHERE_CLUSTER="${VSPHERE_CLUSTER:-Netlab-Cluster-B}"
 VSPHERE_RESOURCE_POOL="${VSPHERE_RESOURCE_POOL:-i416434}"
@@ -11,21 +13,24 @@ VSPHERE_DATASTORE="${VSPHERE_DATASTORE:-NIM01-9}"
 VSPHERE_NETWORK="${VSPHERE_NETWORK:-0124_Internet-DHCP-192.168.124.0_24}"  
 VSPHERE_TEMPLATE="${VSPHERE_TEMPLATE:-/Netlab-DC/vm/_Courses/I3-DB01/i416434/Templates/upscale}"  
 
+# Auto-scaling configuration
 MAX_LOAD="${MAX_LOAD:-70}"
 MIN_LOAD="${MIN_LOAD:-30}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
-MAX_SERVERS="${MAX_SERVERS:-5}"
+MAX_SERVERS="${MAX_SERVERS:-10}"
 MIN_SERVERS="${MIN_SERVERS:-1}"
 VM_BASE_NAME="${VM_BASE_NAME:-webserver}"
 APP_PORT="${APP_PORT:-80}"
 LOAD_BALANCER_PORT="${LOAD_BALANCER_PORT:-8080}"
-LOG_FILE="${LOG_FILE:-auto-scaling.log}" 
+LOG_FILE="/tmp/auto-scaling.log"
 VM_FOLDER="${VM_FOLDER:-/Netlab-DC/vm/_Courses/I3-DB01/i416434/autoscaling}"
+NGINX_CONF="/etc/nginx/conf.d/load-balancer.conf"
+SERVER_LIST_FILE="/tmp/server-list.txt"
 
 echo "Auto-Scaling Script Started at $(date)" > $LOG_FILE
 
 log_message() {
-    echo "$(date): $1" | tee -a $LOG_FILE
+    echo "$(date): $1" | tee -a $LOG_FILE >&2
 }
 
 log_message "Initializing auto-scaling environment for vSphere"
@@ -85,7 +90,101 @@ setup_govc() {
 }
 
 get_vm_list() {
-    govc ls /$VM_FOLDER/ | grep $VM_BASE_NAME | grep -v "${VM_BASE_NAME}-lb" || echo ""
+    govc ls "/$VM_FOLDER/" | grep $VM_BASE_NAME | grep -v "${VM_BASE_NAME}-lb" || echo ""
+}
+
+# Initialize or load the server list
+init_server_list() {
+    if [ ! -f "$SERVER_LIST_FILE" ]; then
+        echo "vm_name,ip_address,status" > $SERVER_LIST_FILE
+    fi
+}
+
+# Add a server to the list
+add_server_to_list() {
+    local vm_name=$1
+    local ip=$2
+    echo "$vm_name,$ip,active" >> $SERVER_LIST_FILE
+}
+
+# Remove a server from the list
+remove_server_from_list() {
+    local vm_name=$1
+    sed -i "\|$vm_name|d" $SERVER_LIST_FILE
+}
+
+# Get all servers from the list
+get_server_list() {
+    if [ -f "$SERVER_LIST_FILE" ]; then
+        tail -n +2 $SERVER_LIST_FILE
+    fi
+}
+
+# Generate nginx configuration based on current server list
+update_nginx_config() {
+    log_message "Updating nginx load balancer configuration"
+    
+    # Get list of active server IPs
+    local server_ips=()
+    while IFS=, read -r vm_name ip status; do
+        if [ "$status" = "active" ]; then
+            server_ips+=("$ip")
+        fi
+    done < <(get_server_list)
+    
+    # Generate upstream server entries
+    local upstream_entries=""
+    for ip in "${server_ips[@]}"; do
+        upstream_entries="${upstream_entries}    server ${ip}:${APP_PORT} max_fails=3 fail_timeout=30s;\n"
+    done
+    
+    # If no servers, add a placeholder comment
+    if [ ${#server_ips[@]} -eq 0 ]; then
+        upstream_entries="    # No servers currently available\n"
+    fi
+    
+    # Create nginx configuration
+    sudo mkdir -p /etc/nginx/conf.d/
+    sudo tee $NGINX_CONF > /dev/null << EOF
+upstream app_servers {
+    least_conn;
+$(echo -e "$upstream_entries")
+}
+
+server {
+    listen ${LOAD_BALANCER_PORT};
+    
+    location / {
+        proxy_pass http://app_servers;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Server \$host;
+        
+        # Add this to disable caching for better load balancer demonstration
+        add_header Cache-Control "no-store, no-cache, must-revalidate, post-check=0, pre-check=0";
+        expires -1;
+    }
+    
+    # Simple load balancer status page
+    location /lb-status {
+        default_type text/html;
+        return 200 '<html><head><title>Load Balancer</title></head><body><h1>Load Balancer Status</h1><p>Load Balancer is running with ${#server_ips[@]} active servers</p><p><a href="/">Go to Web Application</a></p></body></html>';
+    }
+    
+    # Health check endpoint
+    location /health {
+        default_type text/plain;
+        return 200 'Load balancer is healthy\n';
+    }
+}
+EOF
+
+    # Reload nginx
+    sudo systemctl reload nginx || sudo systemctl restart nginx
+    
+    log_message "Nginx configuration updated with ${#server_ips[@]} servers"
 }
 
 create_vm() {
@@ -93,54 +192,60 @@ create_vm() {
     local vm_name="${VM_BASE_NAME}-${vm_num}"
     local vm_path="/$VM_FOLDER/$vm_name"
     
-    log_message "Creating new VM: $vm_name by cloning template $VSPHERE_TEMPLATE"
+    log_message "Creating new VM: $vm_name (will get dynamic IP from DHCP)"
     
-    govc vm.clone -vm "/$VSPHERE_TEMPLATE" -on=true -template=false -ds="$VSPHERE_DATASTORE" -pool="$VSPHERE_RESOURCE_POOL" -folder="$VM_FOLDER" "$vm_name"
+    # Clone the VM with DHCP
+    govc vm.clone -vm "$VSPHERE_TEMPLATE" -on=true -template=false \
+        -ds="$VSPHERE_DATASTORE" -pool="$VSPHERE_RESOURCE_POOL" \
+        -folder="$VM_FOLDER" \
+        -c=2 -m=4096 \
+        -net="$VSPHERE_NETWORK" \
+        "$vm_name"
     
     if [ $? -ne 0 ]; then
         log_message "Failed to clone VM. Check template path and permissions."
         return 1
     fi
     
-    local max_attempts=100
-    local attempts=0
+    # Wait for VM to get an IP (shorter timeout)
+    log_message "Waiting for VM $vm_name to boot and get an IP address..."
     local vm_ip=""
-    
-    log_message "Waiting for VM $vm_name to get an IP address..."
-    
-    while [ -z "$vm_ip" ] && [ $attempts -lt $max_attempts ]; do
-        sleep 10
-        attempts=$((attempts + 1))
+    for i in {1..20}; do
         vm_ip=$(govc vm.ip "$vm_path" 2>/dev/null)
-        log_message "Attempt $attempts: VM IP check - $vm_ip"
+        if [[ $vm_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            log_message "VM obtained IP: $vm_ip"
+            break
+        fi
+        log_message "Waiting for IP address... attempt $i/20"
+        sleep 10
+        
+        if [ $i -eq 20 ]; then
+            log_message "Could not get VM IP address after 20 attempts. Aborting."
+            govc vm.destroy "$vm_path"
+            return 1
+        fi
     done
     
-    if [ -z "$vm_ip" ]; then
-        log_message "Failed to get IP for VM $vm_name after $max_attempts attempts"
-        return 1
-    fi
-    
-    log_message "VM $vm_name created with IP: $vm_ip"
-    
-    # Wait for SSH to become available
+    # Wait for SSH (shorter timeout)
     log_message "Waiting for SSH to be available on $vm_ip..."
-    for i in {1..30}; do
+    for i in {1..15}; do
         if sshpass -p "student" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 student@$vm_ip "echo SSH is up" &> /dev/null; then
             log_message "SSH is available after $i attempts"
             break
         fi
         
-        log_message "Attempt $i: Waiting for SSH..."
-        sleep 10
+        log_message "Attempt $i/15: Waiting for SSH..."
+        sleep 5
         
-        if [ $i -eq 30 ]; then
-            log_message "Failed to connect via SSH after 30 attempts"
+        if [ $i -eq 15 ]; then
+            log_message "Failed to connect via SSH after 15 attempts. Aborting."
+            govc vm.destroy "$vm_path"
             return 1
         fi
     done
     
     # Configure the new webserver
-    log_message "Configuring webserver $vm_name..."
+    log_message "Configuring webserver $vm_name with IP $vm_ip..."
     
     # Create a temporary configuration script
     cat > /tmp/configure-webserver-$vm_num.sh << EOF
@@ -189,7 +294,7 @@ cat << INNEREOF | sudo tee /var/www/html/index.html
         <h1>Web Server $vm_num</h1>
         <div class='server-info'>
             <p><strong>Server Name:</strong> ${VM_BASE_NAME}-$vm_num</p>
-            <p><strong>Server IP:</strong> <span id='server-ip'></span></p>
+            <p><strong>Server IP:</strong> $vm_ip</p>
             <p><strong>Unique ID:</strong> $vm_num</p>
         </div>
         <div class='timestamp'>
@@ -197,7 +302,6 @@ cat << INNEREOF | sudo tee /var/www/html/index.html
         </div>
     </div>
     <script>
-        document.getElementById('server-ip').textContent = location.hostname;
         document.getElementById('timestamp').textContent = new Date().toLocaleString();
         // Refresh the page every 5 seconds to demonstrate load balancing
         setTimeout(function() {
@@ -208,7 +312,7 @@ cat << INNEREOF | sudo tee /var/www/html/index.html
 </html>
 INNEREOF
 
-# Configure UFW firewall - IMPORTANT TO ALLOW TRAFFIC
+# Configure UFW firewall
 echo 'student' | sudo -S ufw allow 22/tcp comment 'Allow SSH'
 echo 'student' | sudo -S ufw allow 80/tcp comment 'Allow HTTP'
 echo 'student' | sudo -S ufw allow 443/tcp comment 'Allow HTTPS'
@@ -223,7 +327,7 @@ echo 'student' | sudo -S systemctl enable nginx
 echo 'student' | sudo -S systemctl restart nginx
 
 # Report success
-echo "Webserver $vm_num configuration completed successfully"
+echo "Webserver $vm_num configuration completed successfully with IP $vm_ip"
 EOF
     
     # Copy and execute the configuration script on the new VM
@@ -232,39 +336,51 @@ EOF
     
     if [ $? -ne 0 ]; then
         log_message "Failed to configure webserver $vm_name. VM may not be set up correctly."
+        return 1
     else
-        log_message "Successfully configured webserver $vm_name"
+        log_message "Successfully configured webserver $vm_name with IP $vm_ip"
     fi
     
     # Clean up
     rm -f /tmp/configure-webserver-$vm_num.sh
     
-    # Verify webserver is responding before adding to load balancer
-    log_message "Verifying webserver is accessible before adding to load balancer..."
+    # Verify webserver is responding
+    log_message "Verifying webserver is accessible at IP $vm_ip..."
     if check_vm_web_service $vm_ip; then
-        log_message "Webserver $vm_name is responding correctly"
-        echo "$vm_ip"
+        log_message "Webserver $vm_name is responding correctly at $vm_ip"
+        
+        # Add the server to our list and update nginx
+        add_server_to_list "$vm_name" "$vm_ip"
+        update_nginx_config
+        
+        # Return the IP address to the caller
+        echo $vm_ip
         return 0
     else
-        log_message "Webserver $vm_name is not responding. Will retry later."
-        echo "$vm_ip"
-        return 0  # Still return the IP so we can try again later
+        log_message "Webserver $vm_name is not responding at $vm_ip. Aborting."
+        govc vm.destroy "$vm_path"
+        return 1
     fi
 }
 
 delete_vm() {
     local vm_path=$1
+    local vm_name=$(basename "$vm_path")
     
     log_message "Deleting VM: $vm_path"
     
     govc vm.power -off "$vm_path"
-    
     govc vm.destroy "$vm_path"
     
     if [ $? -eq 0 ]; then
         log_message "VM $vm_path deleted successfully"
+        # Remove from server list and update nginx
+        remove_server_from_list "$vm_name"
+        update_nginx_config
+        return 0
     else
         log_message "Failed to delete VM $vm_path"
+        return 1
     fi
 }
 
@@ -273,191 +389,27 @@ get_cpu_load() {
 }
 
 setup_load_balancer() {
-    log_message "Setting up load balancer configuration"
-    
-    sudo mkdir -p /etc/nginx/conf.d/
-    sudo tee /etc/nginx/conf.d/load-balancer.conf > /dev/null << EOF
-upstream app_servers {
-    least_conn;
-    server 127.0.0.1:80 down;
-    # Servers will be added dynamically
-}
-
-server {
-    listen ${LOAD_BALANCER_PORT};
-    
-    location / {
-        proxy_pass http://app_servers;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Server \$host;
-        
-        # Add this to disable caching for better load balancer demonstration
-        add_header Cache-Control "no-store, no-cache, must-revalidate, post-check=0, pre-check=0";
-        expires -1;
-    }
-    
-    # Add a status page to show load balancer info
-    location /lb-status {
-        return 200 '<!DOCTYPE html>
-<html>
-<head>
-    <title>Load Balancer Status</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 20px;
-        }
-        h1 {
-            color: #336699;
-        }
-        .status-box {
-            background-color: #f0f8ff;
-            border: 1px solid #ccc;
-            padding: 15px;
-            border-radius: 5px;
-            margin-top: 20px;
-        }
-        button {
-            background-color: #4CAF50;
-            color: white;
-            padding: 10px 15px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            margin-top: 10px;
-        }
-        button:hover {
-            background-color: #45a049;
-        }
-    </style>
-</head>
-<body>
-    <h1>Load Balancer Status</h1>
-    <div class="status-box">
-        <p><strong>Load Balancer:</strong> ${VM_BASE_NAME}-lb</p>
-        <p><strong>Backend Servers:</strong> <span id="server-count">Loading...</span></p>
-        <p><strong>Current Time:</strong> <span id="current-time"></span></p>
-    </div>
-    <button onclick="window.location.href=\'/\'">Go to Web Application</button>
-    
-    <script>
-        // Update current time
-        function updateTime() {
-            document.getElementById("current-time").textContent = new Date().toLocaleString();
-        }
-        updateTime();
-        setInterval(updateTime, 1000);
-        
-        // Make AJAX request to get server count
-        fetch("/health")
-            .then(response => response.text())
-            .then(() => {
-                // This would ideally get the actual server count from somewhere
-                // For now, we\'ll just say "Multiple active servers"
-                document.getElementById("server-count").textContent = "Multiple active servers";
-            })
-            .catch(error => {
-                document.getElementById("server-count").textContent = "Error fetching server status";
-            });
-    </script>
-</body>
-</html>';
-        add_header Content-Type text/html;
-    }
-    
-    # Health check endpoint
-    location /health {
-        return 200 'Load balancer is healthy\n';
-    }
-}
-EOF
-
-    echo "server_name,ip_address,status" > servers.txt
-    
-    sudo systemctl restart nginx >> $LOG_FILE 2>&1 || {
-        log_message "Failed to reload nginx. Check if it's installed and running."
-        exit 1
-    }
-    
-    log_message "Load balancer configured on port $LOAD_BALANCER_PORT"
-    
-    # Create a simple script to test load balancing
-    sudo tee /usr/local/bin/test-load-balancer.sh > /dev/null << 'EOF'
-#!/bin/bash
-
-echo "Load Balancer Test Script"
-echo "========================="
-echo "Making 10 requests to demonstrate load balancing..."
-echo
-
-for i in {1..10}; do
-    echo -n "Request $i: "
-    curl -s http://localhost:8080/ | grep -o '<h1>Web Server [0-9]</h1>' || echo "No response"
-    sleep 1
-done
-
-echo
-echo "Test complete. You should see requests distributed across different web servers."
-echo "To run this test again, use: sudo bash /usr/local/bin/test-load-balancer.sh"
-EOF
-
-    sudo chmod +x /usr/local/bin/test-load-balancer.sh
-    log_message "Created load balancer test script at /usr/local/bin/test-load-balancer.sh"
-}
-
-add_server_to_lb() {
-    local vm_ip=$1
-    
-    log_message "Adding server $vm_ip to load balancer"
-    
-    if grep -q "$vm_ip:$APP_PORT" /etc/nginx/conf.d/load-balancer.conf; then
-        log_message "Server $vm_ip already in load balancer configuration"
-        return 0
-    fi
-    
-    sudo sed -i "/upstream app_servers {/a\\    server ${vm_ip}:${APP_PORT};" /etc/nginx/conf.d/load-balancer.conf
-    
-    sudo nginx -s reload >> $LOG_FILE 2>&1 || {
-        log_message "Failed to reload nginx after adding server $vm_ip"
-        return 1
-    }
-    
-    log_message "Server $vm_ip added to load balancer"
-    return 0
-}
-
-remove_server_from_lb() {
-    local vm_ip=$1
-    
-    log_message "Removing server $vm_ip from load balancer"
-    
-    sudo sed -i "\|server ${vm_ip}:${APP_PORT};|d" /etc/nginx/conf.d/load-balancer.conf
-    
-    sudo nginx -s reload >> $LOG_FILE 2>&1 || {
-        log_message "Failed to reload nginx after removing server $vm_ip"
-        return 1
-    }
-    
-    log_message "Server $vm_ip removed from load balancer"
-    return 0
+    log_message "Setting up initial load balancer configuration"
+    update_nginx_config
 }
 
 check_vm_web_service() {
     local vm_ip=$1
     local timeout=5
     
-    log_message "Checking if $vm_ip web service is responding..."
-    
     if curl -s --connect-timeout $timeout "http://${vm_ip}:${APP_PORT}" > /dev/null; then
-        log_message "Web service on $vm_ip is responding"
         return 0
     else
-        log_message "Web service on $vm_ip is not responding"
         return 1
     fi
+}
+
+update_server_status() {
+    local vm_name=$1
+    local ip=$2
+    local status=$3
+    
+    sed -i "s/^$vm_name,$ip,[^,]*/$vm_name,$ip,$status/" $SERVER_LIST_FILE
 }
 
 # Function to scale up - create a new VM
@@ -476,18 +428,7 @@ scale_up() {
     local vm_ip=$(create_vm $next_vm_num)
     
     if [ -n "$vm_ip" ]; then
-        echo "${VM_BASE_NAME}-${next_vm_num},$vm_ip,active" >> servers.txt
-        
-        log_message "Waiting for web service to start on $vm_ip..."
-        sleep 30
-        
-        if check_vm_web_service $vm_ip; then
-            add_server_to_lb $vm_ip
-            log_message "Scale up complete: ${VM_BASE_NAME}-${next_vm_num} ($vm_ip) added to pool"
-        else
-            log_message "Web service not responding on new VM. Will try again later."
-            sed -i "s/${VM_BASE_NAME}-${next_vm_num},$vm_ip,active/${VM_BASE_NAME}-${next_vm_num},$vm_ip,pending/" servers.txt
-        fi
+        log_message "Scale up complete: ${VM_BASE_NAME}-${next_vm_num} ($vm_ip) added to pool"
     else
         log_message "Failed to create new VM. Scale up aborted."
     fi
@@ -504,38 +445,35 @@ scale_down() {
     
     log_message "Scaling down from $current_vms servers"
     
-    local last_vm=$(echo "$vm_list" | tail -1)
+    # Find the highest-numbered VM (not webserver-1)
+    local vm_to_delete=""
+    local highest_number=0
     
-    local last_vm_ip=$(govc vm.ip "$last_vm" 2>/dev/null)
-    
-    if [ -z "$last_vm_ip" ]; then
-        log_message "Could not get IP for VM $last_vm. Trying to delete anyway."
-    else
-        remove_server_from_lb $last_vm_ip
-    fi
-    
-    delete_vm "$last_vm"
-    
-    local vm_name=$(basename "$last_vm")
-    sed -i "\|$vm_name|d" servers.txt
-    
-    log_message "Scale down complete: $vm_name removed from pool"
-}
-
-simulate_load() {
-    log_message "Starting load simulation for demonstration"
-    
-    for i in {1..3}; do
-        echo "75" > /tmp/simulated_load
-        log_message "Simulated load increased to 75% (should trigger scale up)"
-        sleep 90
+    for vm in $vm_list; do
+        # Extract the VM number from the name
+        vm_name=$(basename "$vm")
+        vm_number=$(echo "$vm_name" | grep -o '[0-9]\+$')
         
-        echo "25" > /tmp/simulated_load
-        log_message "Simulated load decreased to 25% (should trigger scale down)"
-        sleep 90
+        # Skip webserver-1
+        if [ "$vm_number" = "1" ]; then
+            continue
+        fi
+        
+        # Find the VM with the highest number
+        if [ "$vm_number" -gt "$highest_number" ]; then
+            highest_number=$vm_number
+            vm_to_delete=$vm
+        fi
     done
     
-    rm -f /tmp/simulated_load
+    # If we found a VM to delete
+    if [ -n "$vm_to_delete" ]; then
+        log_message "Selected VM to delete: $vm_to_delete (number: $highest_number)"
+        delete_vm "$vm_to_delete"
+        log_message "Scale down complete"
+    else
+        log_message "No suitable VM found for deletion. All remaining VMs are essential."
+    fi
 }
 
 get_system_load() {
@@ -549,26 +487,32 @@ get_system_load() {
 check_servers() {
     log_message "Checking server pool health..."
     
-    local lb_servers=$(grep "server" /etc/nginx/conf.d/load-balancer.conf | grep -v "127.0.0.1" | awk '{print $2}' | cut -d: -f1)
-
-    for server_ip in $lb_servers; do
-        if ! check_vm_web_service $server_ip; then
-            log_message "Server $server_ip not responding. Removing from load balancer."
-            remove_server_from_lb $server_ip
-            
-            sed -i "s/,[^,]*,$server_ip,active/,$server_ip,failed/" servers.txt
+    local update_needed=0
+    while IFS=, read -r vm_name ip status; do
+        # Skip header line
+        if [ "$vm_name" = "vm_name" ]; then
+            continue
         fi
-    done
-    
-    while IFS=, read -r vm_name vm_ip status; do
-        if [ "$status" = "pending" ]; then
-            if check_vm_web_service $vm_ip; then
-                log_message "Pending server $vm_ip now responding. Adding to load balancer."
-                add_server_to_lb $vm_ip
-                sed -i "s/$vm_name,$vm_ip,pending/$vm_name,$vm_ip,active/" servers.txt
+        
+        if check_vm_web_service $ip; then
+            # Update status to active if it wasn't
+            if [ "$status" != "active" ]; then
+                update_server_status "$vm_name" "$ip" "active"
+                update_needed=1
+            fi
+        else
+            # Update status to inactive if it wasn't
+            if [ "$status" != "inactive" ]; then
+                update_server_status "$vm_name" "$ip" "inactive"
+                update_needed=1
             fi
         fi
-    done < <(tail -n +2 servers.txt 2>/dev/null || echo "")
+    done < $SERVER_LIST_FILE
+    
+    # Update nginx if needed
+    if [ $update_needed -eq 1 ]; then
+        update_nginx_config
+    fi
 }
 
 monitor_load() {
@@ -585,7 +529,7 @@ monitor_load() {
         log_message "Current load: $CURRENT_LOAD%, Running servers: $CURRENT_SERVERS"
         
         check_health_counter=$((check_health_counter + 1))
-        if [ $check_health_counter -ge 5 ]; then
+        if [ $check_health_counter -ge 12 ]; then
             check_servers
             check_health_counter=0
         fi
@@ -607,15 +551,17 @@ test_load_balancing() {
     
     for i in {1..10}; do
         echo "Request $i:"
-        curl -s -I "http://localhost:${LOAD_BALANCER_PORT}/" | grep "Server"
+        curl -s "http://localhost:${LOAD_BALANCER_PORT}/" | grep -o '<h1>Web Server [0-9]</h1>'
         sleep 1
     done
 }
 
+# Main execution
 check_dependencies
 setup_govc
+init_server_list
 
-if ! govc ls "$VM_FOLDER" &>/dev/null; then
+if ! govc ls "/$VM_FOLDER" &>/dev/null; then
     log_message "VM folder /$VM_FOLDER not found. Please check your folder name."
     exit 1
 fi
@@ -630,31 +576,22 @@ setup_load_balancer
 EXISTING_VMS=$(get_vm_list | grep $VM_BASE_NAME)
 
 if [ -z "$EXISTING_VMS" ]; then
-    log_message "No existing servers found. Waiting for Terraform to create initial servers..."
-    
-    sleep 60
-    
-    EXISTING_VMS=$(get_vm_list | grep $VM_BASE_NAME)
-fi
-
-if [ -n "$EXISTING_VMS" ]; then
-    log_message "Found existing servers. Adding to load balancer."
+    log_message "No existing servers found. Creating initial server..."
+    scale_up
+else
+    log_message "Found existing servers. Recording in server list."
     
     for vm in $EXISTING_VMS; do
         vm_ip=$(govc vm.ip "$vm" 2>/dev/null)
         if [ -n "$vm_ip" ]; then
             vm_name=$(basename "$vm")
-            echo "$vm_name,$vm_ip,active" >> servers.txt
-            
-            if check_vm_web_service $vm_ip; then
-                add_server_to_lb $vm_ip
-                log_message "Added existing server $vm_name ($vm_ip) to load balancer"
-            else
-                log_message "Existing server $vm_name ($vm_ip) not responding. Marking as pending."
-                sed -i "s/$vm_name,$vm_ip,active/$vm_name,$vm_ip,pending/" servers.txt
-            fi
+            add_server_to_list "$vm_name" "$vm_ip"
+            log_message "Recorded existing server $vm_name ($vm_ip)"
         fi
     done
+    
+    # Update nginx with found servers
+    update_nginx_config
 fi
 
 if [ "$1" = "test-lb" ]; then
@@ -662,6 +599,7 @@ if [ "$1" = "test-lb" ]; then
     test_load_balancing
     exit 0
 fi
+
 log_message "Starting load monitoring in background..."
 monitor_load &
 MONITOR_PID=$!
