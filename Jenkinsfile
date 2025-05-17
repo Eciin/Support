@@ -50,8 +50,7 @@ pipeline {
         }
         
         stage('Approval for Production') {
-            steps
-            timeout(time: 30, unit: 'SECONDS') {
+            steps {
                 input message: 'Tests on staging passed. Deploy to production?', ok: 'Approve'
             }
         }
